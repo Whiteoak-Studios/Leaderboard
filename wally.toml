@@ -1,7 +1,7 @@
 [package]
 name = "fadeluc-123/leaderboard"
 description = "A package conversion of an existing leaderboard module, view original at https://github.com/arxkdev/Leaderboard"
-version = "1.0.0"
+version = "1.2.0"
 registry = "https://github.com/UpliftGames/wally-index"
 realm = "shared"
 license = "MIT"
@@ -16,6 +16,18 @@ include = [
     "default.project.json",
     "wally.toml",
     "src/Modules",
+
+    "src/Board",
+    "src/Board/MemoryShard.luau",
+
+    "src/Util",
+    "src/Util/Compression.luau",
+    "src/Util/Sha1.luau",
+
+    "src/Logger.luau",
+    "src/Promise.luau",
+    "src/Signal.luau",
+    "src/UserIdCache.luau",
 ]
 
 [dependencies]
