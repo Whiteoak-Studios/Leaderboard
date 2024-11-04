@@ -18,9 +18,11 @@ include = [
     "src/Modules",
 
     "src/Board",
+    "src/Board/init.luau",
     "src/Board/MemoryShard.luau",
 
     "src/Util",
+    "src/init.luau",
     "src/Util/Compression.luau",
     "src/Util/Sha1.luau",
 
