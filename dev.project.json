@@ -1,0 +1,14 @@
+{
+	"name": "Leaderboard",
+	"servePlaceIds": [129875501987679],
+	"servePort": 34885,
+	"tree": {
+		"$className": "DataModel",
+		"ServerScriptService": {
+			"ServerPackages": {
+				"$className": "Folder",
+				"Leaderboard": { "$path": "src" }
+			}
+		}
+	}
+}
