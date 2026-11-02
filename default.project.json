@@ -1,7 +1,1 @@
-{
-  "name": "leaderboard",
-
-  "tree": {
-      "$path": "src"
-  }
-}
+{ "name": "leaderboard", "tree": { "$path": "src" } }
