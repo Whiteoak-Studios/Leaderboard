@@ -6,9 +6,10 @@
 		"$className": "DataModel",
 		"ServerScriptService": {
 			"ServerPackages": {
-				"$className": "Folder",
+				"$path": "Packages",
 				"Leaderboard": { "$path": "src" }
-			}
+			},
+			"LiveRun": { "$path": "dev" }
 		}
 	}
 }

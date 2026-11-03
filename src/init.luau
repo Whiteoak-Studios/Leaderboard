@@ -1,534 +1,388 @@
 --[[
-	Arxk @ 2023
-]]
-local Players = game:GetService("Players");
+    The Leaderboard object a game builds: up to seven boards over the stores,
+    the queue its saves write, its reads and automation, and the one shutdown
+    that saves every object before the server closes
+--]]
 
--- Requirements
-local Util = require(script.Util);
-local Signal = require(script.Signal);
-local Promise = require(script.Promise);
-local Board = require(script.Board);
-local Logger = require(script.Logger);
+--!strict
+local Leaderboard = {}
+Leaderboard.__index = Leaderboard
 
--- Variables
-local SmartAssert = Util.SmartAssert;
-local KeysInDictionary = Util.KeysInDictionary;
-local GenerateGUID = Util.GenerateGUID;
-local Spawn = task.spawn;
-local Cancel = task.cancel;
+local Promise: any = require(script.Parent.Promise)
+local Signal = require(script.Parent.Signal)
 
--- Constants
-local MEMORY_STORE_SERVICE_MAX_EXPIRY = Util.MEMORY_STORE_SERVICE_MAX_EXPIRY;
-local BOARD_TYPES = Util.BOARD_TYPES;
-local MAX_OVERALL_LEADERBOARDS = 3; -- Overall, you can only create 5 leaderboards using Leaderboard.new, this is to prevent rate limiting
-local MAX_BOARDS = 7; -- You can only create up to 7 boards per leaderboard
+local Board = require(script.Board)
+local Constants = require(script.Constants)
+local Queue = require(script.Queue)
+local Read = require(script.Read)
+local Types = require(script.Config.Types.Leaderboard)
+local Validate = require(script.Validate)
+local Write = require(script.Write)
 
---[=[
-	@within Leaderboard
-	@interface TopData
-	@field Rank number
-	@field UserId number
-	@field Value number
-	@field Username string
-	@field DisplayName string
-]=]
-export type TopData = {
-	Rank: number,
-	UserId: number,
-	Value: number,
-	Username: string,
-	DisplayName: string,
-}
+local MAX_OBJECTS: number = Constants.MAX_OBJECTS
+local MAX_BOARDS: number = Constants.MAX_BOARDS
 
---[=[
-	@within Leaderboard
-	@interface AllTopData
-	@field Type LeaderboardType
-	@field Data {TopData}
-]=]
-type AllTopData = {
-	Type: LeaderboardType,
-	Data: {TopData},
-}
+--- @class Leaderboard
+--- Time-windowed global leaderboards on the server. An object holds up to
+--- seven boards, queues increments in memory, saves them to the stores and
+--- reads each board's highest rows, by hand or on its automation
 
--- Supports Daily, Weekly, Monthly and AllTime currently
---[=[
-    @within Leaderboard
-    @type Leaderboard () -> Leaderboard
-]=]
-export type Leaderboard = typeof(setmetatable({} :: LeaderboardArguments, {} :: Object));
+--- @type BoardConfig string | { expirySeconds: number, key: string }
+--- @within Leaderboard
+--- A board's storage. A key string builds the window a board named Hourly,
+--- Daily, Weekly, Monthly or AllTime keeps, and a table builds a rolling
+--- board of any name, its window `expirySeconds` from each player's first write
 
---[=[
-    @within Leaderboard
-    @type LeaderboardType "Hourly" | "Daily" | "Weekly" | "Monthly" | "Yearly" | "AllTime" | string;
-]=]
-export type LeaderboardType = "Hourly" | "Daily" | "Weekly" | "Monthly" | "Yearly" | "AllTime" | string;
+export type BoardConfig = Board.BoardConfig
+export type Automation = Types.Automation
+export type BoardResult = Types.BoardResult
+export type Leaderboard = Types.Leaderboard
+export type Row = Types.Row
 
---[=[
-	@within Leaderboard
-	@type LeaderboardTypeArgument {[LeaderboardType]: any}
-]=]
-export type LeaderboardTypeArgument = {
-	[LeaderboardType]: any,
-}
+type Board = Board.Board
+type Fields = Types.Fields
+type Range = Types.Range
+type Self = Types.Leaderboard
+type Targets = Types.Targets
 
---[=[
-	@within Leaderboard
-	@interface LeaderboardArguments
-	@field Updated Signal<{AllTopData}>
-	@field BoardUpdated Signal<{Type: LeaderboardType, Data: {TopData}}>
-	@field _serviceKey string
-	@field _types LeaderboardTypeArgument
-	@field _boards {[LeaderboardType]: Board}
-	@field _valueQueue ValueQueueType
-	@field _threads {thread}
-	@field _connections {RBXScriptConnection}
-	@field _logger Logger.Logger?
-]=]
-export type LeaderboardArguments = {
-	Updated: Signal.Signal<{AllTopData}>,
-	BoardUpdated: Signal.Signal<{Type: LeaderboardType, Data: {TopData}}>,
-	_serviceKey: string,
-	_types: LeaderboardTypeArgument,
-	_boards: {[LeaderboardType]: Board},
-	_valueQueue: ValueQueueType,
-	_threads: {thread},
-	_connections: {RBXScriptConnection},
-	_logger: Logger.Logger?,
-}
+local Live: { [Self]: true } = {} -- Every object built and not yet destroyed, which BindToClose destroys
+local InFlight: { [any]: Self } = {} -- A promise settling with each save, set and delete in flight, to its object
 
---[=[
-	@within Leaderboard
-	@interface Board
-	@field GetRecords (self: Board, amount: number, sortDirection: string) -> Promise.TypedPromise<{TopData}>
-	@field Update (self: Board, userId: number, value: number | (number) -> (number)) -> boolean
-	@field Destroy (self: Board) -> ()
-]=]
-type ValueQueueType = {
-	[number]: {
-		[LeaderboardType]: {
-			Amount: number,
-			Board: Board,
-		},
-	},
-}
+--- Builds an object over its boards and, given an automation that is on,
+--- starts its loop, whose first read runs at once. Throws on no boards, more
+--- than 7, a board's configuration `Board` refuses, two boards sharing a
+--- key, an automation it cannot run, or a fourth live object, and an object
+--- that throws holds no slot
+--- @function new
+--- @within Leaderboard
+--- @param boards { [string]: BoardConfig } -- Each board's name to its storage
+--- @param automation Automation? -- How the object reads and saves on its own, or nil for neither
+--- @return Leaderboard
 
---[=[
-	@within Leaderboard
-	@interface Object
-	@field IncrementValues (self: Leaderboard, boardTypes: {LeaderboardType} | string, userId: number, amount: number) -> ()
-	@field SetValues (self: Leaderboard, boardTypes: {LeaderboardType} | string, userId: number, value: number | (number) -> (number)) -> ()
-	@field UpdateStoreValues (self: Leaderboard, boardTypes: {LeaderboardType} | string, userId: number, value: number | (number) -> (number)) -> ()
-	@field GetRecords (self: Leaderboard, boardTypes: {LeaderboardType} | string, optionalRange: {[LeaderboardType | string]: number} | number, sortDirection: string) -> Promise.TypedPromise<{AllTopData}>
-	@field SaveValues (self: Leaderboard) -> Promise.TypedPromise<nil>
-	@field Destroy (self: Leaderboard) -> ()
-	@field new (leaderboardTypes: {LeaderboardType}, automationSettings: AutomationSettings?, debugMode: boolean?) -> Leaderboard
-]=]
-type Object = {
-	__index: Object,
-	IncrementValues: (self: Leaderboard, boardTypes: {LeaderboardType} | string, userId: number, amount: number) -> (),
-	SetValues: (self: Leaderboard, boardTypes: {LeaderboardType} | string, userId: number, value: number | (number) -> (number)) -> (),
-	UpdateStoreValues: (self: Leaderboard, boardTypes: {LeaderboardType} | string, userId: number, value: number | (number) -> (number)) -> (),
-	GetRecords: (self: Leaderboard, boardTypes: {LeaderboardType} | string, optionalRange: {[LeaderboardType | string]: number} | number, sortDirection: string) -> Promise.TypedPromise<{AllTopData}>,
-	SaveValues: (self: Leaderboard) -> Promise.TypedPromise<nil>,
-	Destroy: (self: Leaderboard) -> (),
-	new: (leaderboardTypes: LeaderboardTypeArgument, automationSettings: AutomationSettings?, debugMode: boolean?) -> Leaderboard,
-}
+function Leaderboard.new(boards: { [string]: BoardConfig }, automation: Automation?): Self
+	local live: number = 0
+	for _ in Live do
+		live += 1
+	end
 
-type Board = Board.Board;
+	if live >= MAX_OBJECTS then
+		error(`Leaderboard.new found {MAX_OBJECTS} live objects, the most a server holds; destroy one first`, 0)
+	end
 
---[=[
-	@within Leaderboard
-	@interface AutomationSettings
-	@field Automation boolean?
-	@field Interval number?
-	@field RecordCount number | {[string]: number}?
-]=]
-type AutomationSettings = {
-	Automation: boolean,
-	Interval: number,
-	RecordCount: number | {[string]: number},
-}
+	local given: unknown = boards
+	if type(given) ~= "table" then
+		error(`Leaderboard.new takes its boards as a dictionary by name, not a {typeof(given)}`, 0)
+	end
 
---[=[
-	@within Leaderboard
-	@readonly
-	@prop Updated Signal<{AllTopData}>
+	local names: { string } = {}
+	for name: string in boards do
+		table.insert(names, name)
+	end
 
-	Fired when the leaderboard is updated.
-]=]
---[=[
-	@within Leaderboard
-	@readonly
-	@prop BoardUpdated Signal<{Type: LeaderboardType, Data: {TopData}}>
+	if #names == 0 or #names > MAX_BOARDS then
+		error(`Leaderboard.new takes 1 to {MAX_BOARDS} boards, not {#names}`, 0)
+	end
 
-	Fired when a specific board is updated.
-]=]
+	Board.validateAll(boards)
+	table.sort(names)
 
-local Leaderboards = {} :: {[string]: Leaderboard};
+	-- settings stays any, since neither checker reads a field off a value refined only to a table
+	local settings: any = automation
+	local automated: boolean = false
+	local recordCount: unknown = nil
 
---[=[
-	@class Leaderboard
+	if settings ~= nil then
+		if type(settings) ~= "table" then
+			error(`Leaderboard.new takes its automation as a table, not a {typeof(settings)}`, 0)
+		end
 
-	Leaderboard allows you to create a leaderboard that can be used to store and retrieve data for a specific service key.
+		if type(settings.automation) ~= "boolean" then
+			error(`Leaderboard.new's automation.automation is a boolean, not {settings.automation}`, 0)
+		end
 
-	For example:
-	```lua
-	local Leaderboard = require(game:GetService("ReplicatedStorage").Leaderboard);
-	local MoneyLeaderboard = Leaderboard.new({
-		Daily = "DailyMoneyKey1",
-		Weekly = "WeeklyMoneyKey1"
-	});
-	```
-]=]
-local Leaderboard: Object = {} :: Object;
-Leaderboard.__index = Leaderboard;
+		local interval: unknown = settings.interval
+		if settings.automation and not (type(interval) == "number" and interval > 0 and interval < math.huge) then
+			error(`Leaderboard.new's automation.interval is a positive number of seconds, not {interval}`, 0)
+		end
 
-local function IsValidLeaderboardType(leaderboardType: LeaderboardType, boardKey: string | {number & string}): boolean
-	if (type(boardKey) == "table") then
-		local RollingExpiry = type(boardKey) == "table" and boardKey[1] or nil;
-		return RollingExpiry >= 60 and RollingExpiry <= MEMORY_STORE_SERVICE_MAX_EXPIRY;
-	end;
-	return table.find(BOARD_TYPES, leaderboardType) ~= nil;
+		automated = settings.automation
+		recordCount = settings.recordCount
+	end
+
+	local amounts: { [string]: number } =
+		Validate.amounts(names, "Leaderboard.new's automation.recordCount", recordCount)
+
+	local built: { [string]: Board } = {}
+	for name: string, config: BoardConfig in boards do
+		built[name] = Board.new(name, config)
+	end
+
+	local fields: Fields = {
+		updated = Signal.new() :: Signal.Signal<{ BoardResult }>,
+		boardUpdated = Signal.new() :: Signal.Signal<BoardResult>,
+		_boards = built,
+		_names = names,
+		_recordCount = amounts,
+		_queue = Queue.new(),
+		_thread = nil :: thread?,
+		_destroyed = false,
+	}
+
+	local object: Self = setmetatable(fields, Leaderboard) :: any
+	if automated then
+		object._thread = task.spawn(object._run, object, settings.interval)
+	end
+
+	Live[object] = true
+
+	return object
 end
 
---[=[
-	@param leaderboardTypes LeaderboardTypeArgument
-	@param automationSettings AutomationSettings?
-	@param debugMode boolean?
-	@return Leaderboard
+--- Adds an amount to each named board's queue for the player, for the
+--- next save to write. It never yields and touches no store, so it is safe
+--- thousands of times a frame, and it throws on a board the object does not
+--- hold or a bad number, queuing nothing
+--- @method increment
+--- @within Leaderboard
+--- @param boards "All" | { [string]: true } -- Every board, or a dictionary holding true for each board it targets
+--- @param userId number -- A whole number; a negative one passes, as Studio's test players have
+--- @param amount number -- A whole, non-negative number
 
-	Constructs a new leaderboard.
-]=]
-function Leaderboard.new(leaderboardTypes: LeaderboardTypeArgument, automationSettings: AutomationSettings?, debugMode: boolean?)
-	-- Check if the leaderboard types are valid
-	SmartAssert(#KeysInDictionary(leaderboardTypes) > 0, "Leaderboard types must be greater than 0");
-	SmartAssert(#KeysInDictionary(leaderboardTypes) <= MAX_BOARDS, `You can only create up to {MAX_BOARDS} types of leaderboards`);
-	for boardType, boardKey in leaderboardTypes do
-		SmartAssert(IsValidLeaderboardType(boardType, boardKey), `Leaderboard type {boardType} is not valid`);
-		SmartAssert(boardKey ~= "", "Leaderboard key must not be empty");
-	end;
+function Leaderboard.increment(self: Self, boards: Targets, userId: number, amount: number)
+	self:_checkLive("increment")
+	
+	local names: { string } = Validate.targets("increment", self._names, boards)
+	Validate.userId("increment", userId)
+	Validate.count("increment", "an amount", amount)
 
-	-- Check if they've exceeded the max leaderboards
-	SmartAssert(#KeysInDictionary(Leaderboards) < MAX_OVERALL_LEADERBOARDS, `You can only create up to {MAX_OVERALL_LEADERBOARDS} leaderboards`);
-
-	-- Asserts for settings
-	if (automationSettings) then
-		SmartAssert(type(automationSettings) == "table", "Settings must be a table");
-		SmartAssert(type(automationSettings.Automation) == "nil" or type(automationSettings.Automation) == "boolean", "Automation must be a boolean");
-		SmartAssert(type(automationSettings.Interval) == "nil" or type(automationSettings.Interval) == "number", "Interval must be a number");
-		SmartAssert(type(automationSettings.RecordCount) == "nil" or type(automationSettings.RecordCount) == "number" or type(automationSettings.RecordCount) == "table", "RecordCount must be a number or a table");
-	end;
-
-	local self = setmetatable({} :: LeaderboardArguments, Leaderboard);
-
-	-- Public properties
-	self.Updated = Signal.new();
-	self.BoardUpdated = Signal.new();
-
-	-- Private properties
-	self._serviceKey = GenerateGUID();
-	self._types = leaderboardTypes;
-	self._boards = {};
-	self._valueQueue = {};
-	self._threads = {};
-	self._connections = {};
-	self._logger = Logger.new("Leaderboard", debugMode or false);
-
-	-- Add to leaderboards
-	Leaderboards[self._serviceKey] = self;
-
-	-- Initialize boards
-	for boardType, boardKey in leaderboardTypes do
-		self._boards[boardType] = Board.new(typeof(boardKey) == "table" and boardKey[2] or boardKey, boardType, typeof(boardKey) == "table" and boardKey[1] or nil, debugMode);
-	end;
-
-	-- Start automation
-	if (automationSettings and automationSettings.Automation) then
-		local Thread = Spawn(function()
-			local Times = 0;
-
-			while (true) do
-				Times += 1;
-
-				-- Get the top and update the signal
-				local Data = self:GetRecords("All", automationSettings.RecordCount):awaitValue();
-				if (Data) then
-					self.Updated:Fire(Data);
-					for _, board in Data do
-						self.BoardUpdated:Fire(board);
-					end;
-				end;
-
-				-- We work in alternating turns, so one loop we'll update the value queue, the next we'll update the actual store value(s)
-				if (Times % 2 == 0) then
-					-- Update the value from the queue
-					self:SaveValues();
-				end;
-
-				task.wait(automationSettings.Interval);
-			end;
-		end);
-		table.insert(self._threads, Thread);
-	end;
-
-	-- Player removing
-	table.insert(self._connections, Players.PlayerRemoving:Connect(function(player)
-		-- Remove the player from the value queue
-		if (self._valueQueue[player.UserId]) then
-			self._valueQueue[player.UserId] = nil;
-		end;
-	end));
-
-	return self;
+	for _, name: string in names do
+		self._queue:add(userId, name, amount)
+	end
 end
 
--- Flushes the queue
--- Should only be used every 90-120 seconds
---[=[
-	@yields
-	Updates the actual store value(s) (should only be used every 90-120 seconds)
-]=]
-function Leaderboard:SaveValues()
-	local Promises = {};
-	for UserId, BoardType in self._valueQueue do
-		for _, Data in BoardType do
-			local PromiseUpdate = Data.Board:Update(UserId, function(oldValue)
-				return (oldValue + Data.Amount); -- Increment the value
-			end):andThen(function()
-				self._valueQueue[UserId] = nil;
-			end);
-			table.insert(Promises, PromiseUpdate);
-		end;
-	end;
+--- Writes the value straight to each named board, as a number or as a
+--- function given the player's stored value. An `AllTime` board keeps the
+--- higher value. A bad number throws at the call, and a function whose
+--- return breaks the same rule rejects that board's write
+--- @method set
+--- @within Leaderboard
+--- @param boards "All" | { [string]: true } -- Every board, or a dictionary holding true for each board it targets
+--- @param userId number -- A whole number; a negative one passes, as Studio's test players have
+--- @param value number | (old: number) -> number -- A whole, non-negative number, or a function returning one
+--- @return Promise<()> -- Resolves once every write has landed, and rejects once all settle if one failed
 
-	return Promise.all(Promises);
+function Leaderboard.set(self: Self, boards: Targets, userId: number, value: number | (old: number) -> number): any
+	self:_checkLive("set")
+	
+	local names: { string } = Validate.targets("set", self._names, boards)
+	Validate.userId("set", userId)
+
+	local transform: (old: number) -> number
+	if type(value) == "function" then
+		local given: (old: number) -> number = value
+
+		-- Runs inside each store's UpdateAsync, so a bad return fails that write rather than the call
+		transform = function (old: number): number
+			local returned: number = given(old)
+			Validate.count("set", "a value", returned)
+
+			return returned
+		end
+	else
+		local fixed: number = value
+		Validate.count("set", "a value", fixed)
+
+		transform = function (): number
+			return fixed
+		end
+	end
+
+	local writes: { any } = {}
+	for _, name: string in names do
+		local write: any = self._boards[name]:update(userId, transform)
+		table.insert(writes, write)
+	end
+
+	return self:_track(self:_settleAll(writes, `set {userId}'s value`))
 end
 
--- Gets the data for all the top boards (should only be used every 90-120 seconds)
---[=[
-	@param boardTypes {LeaderboardType} | "All"
-	@param optionalRange {[string]: number} | number
-	@param sortDirection string
-	@yields
+--- Writes everything queued to the stores, taking the queue as its writes
+--- start, with at most 30 board writes in flight across every object's
+--- saves on the server. A write that fails puts its amount back in the
+--- queue, and an amount queued while the save runs waits for the next one
+--- @method save
+--- @within Leaderboard
+--- @return Promise<()> -- Resolves once every write has landed, and rejects once all settle if one failed
 
-	@return Promise<{AllTopData}>
+function Leaderboard.save(self: Self): any
+	self:_checkLive("save")
 
-	Gets the data for all the top boards (should only be used every 90-120 seconds)
-]=]
-function Leaderboard:GetRecords(boardTypes, optionalRange, sortDirection)
-	SmartAssert(type(sortDirection) == "nil" or typeof(sortDirection) == "string", "SortDirection must be a string");
-	sortDirection = sortDirection or "Descending";
-
-	-- If boardTypes is all, get all the boards
-	if (boardTypes == "All") then
-		boardTypes = self._types;
-	end;
-
-	-- Check if the optional range is valid
-	if (optionalRange) then
-		SmartAssert(type(optionalRange) == "number" or type(optionalRange) == "table", "Optional range must be a number or a table");
-		if (type(optionalRange) == "number") then
-			SmartAssert(optionalRange <= 100, "You can only get the top 100.");
-			SmartAssert(optionalRange > 0, "Optional range must be greater than 0");
-		else
-			for k, v in optionalRange do
-				SmartAssert(IsValidLeaderboardType(k, v), `Leaderboard type {k} is not valid`);
-				SmartAssert(type(v) == "number", "Optional range values must be a number");
-				SmartAssert(v <= 100, "You can only get the top 100.");
-				SmartAssert(v > 0, "Optional range values must be greater than 0");
-			end;
-		end;
-	end;
-
-	-- Get all the data
-	local Promises = {};
-	for boardType in boardTypes do
-		local BoardClass = self._boards[boardType] :: Board;
-		SmartAssert(BoardClass ~= nil, `Board type {boardType} does not exist`)
-
-		local Amount = optionalRange and (type(optionalRange) == "number" and optionalRange or optionalRange[boardType]) or 100;
-		table.insert(Promises, BoardClass:Get(Amount, sortDirection):andThen(function(data)
-			return {
-				Type = boardType, -- We want to tell the difference between rolling and non-rolling
-				Data = data,
-			}
-		end));
-	end;
-
-	return Promise.all(Promises) :: Promise.TypedPromise<{AllTopData}>;
+	return self:_track(self:_write())
 end
 
--- Increments the queued value(s)
--- either Leaderboard:IncrementValues(nil, userId, amount) or Leaderboard:IncrementValues({"Daily", "Weekly"}, userId, amount
---[=[
-	Increments the queued value(s)
-	@param boardTypes {LeaderboardType} | "All"
-	@param userId number
-	@param amount number
+--- Reads each named board's highest rows, highest first, with each row's
+--- names from the cache, nil for a user it does not hold yet. It never
+--- waits on a name: the ids it lacks go to one background lookup, and a
+--- later read has them
+--- @method getAll
+--- @within Leaderboard
+--- @param boards "All" | { [string]: true } -- Every board, or a dictionary holding true for each board it targets
+--- @param range (number | { [string]: number })? -- Rows from 1 to 100, for every board or by name; 100 by default
+--- @return Promise<{ BoardResult }> -- In the order of the boards' names, rejecting if any board's read fails
 
-	Increments the queued value(s)
-]=]
-function Leaderboard:IncrementValues(boardTypes, userId, amount)
-	SmartAssert(type(userId) == "number", "UserId must be a number");
-	SmartAssert(type(amount) == "number", "Amount must be a number");
-	SmartAssert(type(boardTypes) == "table" or type(boardTypes) == "string", "BoardTypes must be a table or a string");
+function Leaderboard.getAll(self: Self, boards: Targets, range: Range?): any
+	self:_checkLive("getAll")
+	local names: { string } = Validate.targets("getAll", self._names, boards)
+	local amounts: { [string]: number } = Validate.amounts(self._names, "Leaderboard:getAll's range", range)
 
-	-- If boardTypes is all, increment all the boards
-	if (boardTypes == "All") then
-		boardTypes = self._types;
-	end;
+	return self:_read(names, amounts):andThen(function (results: { BoardResult }, failures: { string }): any
+		if #failures > 0 then
+			return Promise.reject(table.concat(failures, "; "))
+		end
 
-	-- Reconcile the value queue
-	if (not self._valueQueue[userId]) then
-		self._valueQueue[userId] = {};
-	end;
-
-	local Queue = self._valueQueue[userId];
-	for boardType in boardTypes do
-		-- Update the value queue
-		if (not Queue[boardType]) then
-			Queue[boardType] = {
-				Amount = amount,
-				Board = self._boards[boardType]
-			};
-		else
-			Queue[boardType].Amount += amount;
-		end;
-	end;
+		return results
+	end)
 end
 
--- Updates the queued value(s)
--- either Leaderboard:SetValues("All", userId, value) or Leaderboard:SetValues({"Daily", "Weekly"}, userId, value
---[=[
-	Updates the queued value(s)
-	@param boardTypes {LeaderboardType} | "All"
-	@param userId number
-	@param value number | (number) -> (number)
+--- Takes a player off each named board: waits for this object's writes in
+--- flight to settle, then deletes the player's queued amount and their
+--- stored entries, so no failed write's amount can bring them back
+--- @method delete
+--- @within Leaderboard
+--- @param boards "All" | { [string]: true } -- Every board, or a dictionary holding true for each board it targets
+--- @param userId number -- A whole number
+--- @return Promise<()> -- Resolves once every removal has landed, and rejects once all settle if one failed
 
-	Updates the queued value(s)
-]=]
-function Leaderboard:SetValues(boardTypes, userId, value)
-	SmartAssert(type(userId) == "number", "UserId must be a number");
-	SmartAssert(type(value) == "function" or type(value) == "number", "Value must be a function or a number");
-	SmartAssert(type(boardTypes) == "table" or type(boardTypes) == "string", "BoardTypes must be a table or a string");
+function Leaderboard.delete(self: Self, boards: Targets, userId: number): any
+	self:_checkLive("delete")
+	local names: { string } = Validate.targets("delete", self._names, boards)
+	Validate.userId("delete", userId)
 
-	-- If boardTypes is all, update all the boards
-	if (boardTypes == "All") then
-		boardTypes = self._types;
-	end;
+	local function deleteQueued()
+		for _, name: string in names do
+			self._queue:delete(userId, name)
+		end
+	end
 
-	-- Reconcile the value queue
-	if (not self._valueQueue[userId]) then
-		self._valueQueue[userId] = {};
-	end;
+	-- Deleted now, so a save starting while the delete waits cannot take the amount, and again once the
+	-- writes in flight settle, since a failed one puts its amount back
+	deleteQueued()
 
-	local Queue = self._valueQueue[userId];
-	for boardType in boardTypes do
-		-- Update the value queue
-		if (not Queue[boardType]) then
-			Queue[boardType] = {
-				Amount = value,
-				Board = self._boards[boardType],
-			};
-		else
-			Queue[boardType].Amount = value;
-		end;
-	end;
+	local work: any = Promise.allSettled(self:_pending()):andThen(function (): any
+		deleteQueued()
+
+		local removals: { any } = {}
+		for _, name: string in names do
+			local removal: any = self._boards[name]:delete(userId)
+			table.insert(removals, removal)
+		end
+
+		return self:_settleAll(removals, `delete {userId}`)
+	end)
+
+	return self:_track(work)
 end
 
--- Updates the actual store value(s) (should only be used every 90-120 seconds)
--- either Leaderboard:UpdateStoreValues(nil, userId, value) or Leaderboard:UpdateStoreValues({"Daily", "Weekly"}, userId, value
---[=[
-	Updates the actual store value(s) (should only be used every 90-120 seconds)
-	@param boardTypes {LeaderboardType} | "All"
-	@param userId number
-	@param value number | (number) -> (number)
-	@yields
+--- Ends the object: cancels its automation at once, disconnects every
+--- subscriber of its signals and frees its slot, then makes a last save once
+--- its writes in flight have settled. Every method called afterwards throws
+--- @method destroy
+--- @within Leaderboard
+--- @return Promise<()> -- The last save's
 
-	Updates the actual store value(s) (should only be used every 90-120 seconds)
-]=]
-function Leaderboard:UpdateStoreValues(boardTypes, userId, value)
-	SmartAssert(type(userId) == "number", "UserId must be a number");
-	SmartAssert(type(value) == "function" or type(value) == "number", "Value must be a function or a number");
-	SmartAssert(type(boardTypes) == "table" or type(boardTypes) == "string", "BoardTypes must be a table or a string");
+function Leaderboard.destroy(self: Self): any
+	self:_checkLive("destroy")
 
-	-- If boardTypes is all, update all the boards
-	if (boardTypes == "All") then
-		boardTypes = self._types;
-	end;
+	self._destroyed = true
+	Live[self] = nil
 
-	for boardType in boardTypes do
-		local BoardClass = self._boards[boardType] :: Board;
-		if (not BoardClass) then
-			error(`Board type {boardType} does not exist`, 2);
-		end;
+	if self._thread then
+		task.cancel(self._thread)
+	end
 
-		BoardClass:Update(userId, value);
-	end;
+	self.updated:DisconnectAll()
+	self.boardUpdated:DisconnectAll()
+
+	-- The last save waits out the writes in flight, so an amount a failed one puts back goes with it
+	local work: any = Promise.allSettled(self:_pending()):andThen(function (): any
+		return self:_write()
+	end)
+
+	return self:_track(work)
 end
 
--- Destroys the leaderboard
---[=[
-	Destroys the leaderboard
-]=]
-function Leaderboard:Destroy()
-	-- Update the value from the queue
-	self:SaveValues();
+--[[
+    Throws, naming the call, once the object has been destroyed
+--]]
 
-	-- Destroy all the boards
-	for _, board in self._boards do
-		board:Destroy();
-	end;
-
-	-- Cancel all the threads
-	for _, thread in self._threads do
-		if (typeof(thread) == "thread") then
-			Cancel(thread);
-		end;
-	end;
-
-	-- Disconnect all the connections
-	for _, connection in self._connections do
-		connection:Disconnect();
-	end;
-
-	-- Logger destroy
-	self._logger:Destroy();
-
-	-- Remove from leaderboards
-	if (Leaderboards[self._serviceKey]) then
-		Leaderboards[self._serviceKey] = nil;
-	end;
-
-	-- Destroy the metatable
-	setmetatable(self, nil);
+function Leaderboard._checkLive(self: Self, method: string)
+	if self._destroyed then
+		error(`Leaderboard:{method} was called on a destroyed object`, 0)
+	end
 end
 
--- Bind to close, destroy all the leaderboards
-game:BindToClose(function()
-	for _, leaderboard in Leaderboards do
-		Spawn(function()
-			leaderboard:Destroy();
+--[[
+    Holds a write in flight until it settles, so a delete, a last save and
+    the shutdown can wait on it, and hands the caller a promise of its own,
+    since canceling the one the write runs on would close it mid-write
+--]]
+
+function Leaderboard._track(self: Self, work: any): any
+	-- What InFlight holds never rejects, since allSettled warns of every rejected promise it is handed, even
+	-- one another handler has caught
+	local done: any = work:catch(function () end)
+	InFlight[done] = self
+
+	done:finally(function ()
+		InFlight[done] = nil
+	end)
+
+	return Promise.new(function (resolve: any, reject: any)
+		work:andThen(resolve, reject)
+	end)
+end
+
+--[[
+    Every save, set and delete this object still has in flight
+--]]
+
+function Leaderboard._pending(self: Self): { any }
+	local works: { any } = {}
+	for work: any, owner: Self in InFlight do
+		if owner == self then
+			table.insert(works, work)
+		end
+	end
+
+	return works
+end
+
+-- The server's close destroys every live object and returns once every write in flight has settled
+game:BindToClose(function ()
+	for object: Self in Live do
+		object:destroy():catch(function (reason: any)
+			warn(`Leaderboard's last save at shutdown failed: {reason}`)
 		end)
-	end;
-end);
+	end
 
--- Make indexing the class with the wrong key throw an error
-setmetatable(Leaderboard, {
-	__index = function(_, key)
-		error(`Attempt to get Leaderboard:{tostring(key)} (not a valid member)`, 2);
-	end,
-	__newindex = function(_, key, _)
-		error(`Attempt to set Leaderboard:{tostring(key)} (not a valid member)`, 2);
-	end,
-})
+	local works: { any } = {}
+	for work: any in InFlight do
+		table.insert(works, work)
+	end
 
-return table.freeze({
-	new = Leaderboard.new,
-	IncrementValues = Leaderboard.IncrementValues,
-	SetValues = Leaderboard.SetValues,
-	UpdateStoreValues = Leaderboard.UpdateStoreValues,
-	GetRecords = Leaderboard.GetRecords,
-	Destroy = Leaderboard.Destroy,
-})
+	Promise.allSettled(works):await()
+end)
+
+local _: Types.Own, _: Types.Write, _: Types.Read = Leaderboard, Write, Read
+
+-- The saves and the reads are a sibling each, merged onto the class, and a name defined twice is a bug
+local parts: { any } = { Write, Read }
+
+for _, part: any in parts do
+	for name: string, method: any in part do
+		assert(Leaderboard[name] == nil, `Leaderboard.{name} is defined twice`)
+		Leaderboard[name] = method
+	end
+end
+
+return Leaderboard

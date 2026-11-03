@@ -1,332 +1,201 @@
 --[[
-	Arxk was here
-]]
+    One board, a window over one stat: AllTime's highest values in an
+    ordered store, or a period's or rolling window's top rows over totals
+--]]
 
--- DataStoreService to handle longer than 42 days (all time most likely)
-local DataStoreService = game:GetService("DataStoreService");
+--!strict
+local Board = {}
+Board.__index = Board
 
--- Requirements
-local MemoryShard = require(script.MemoryShard);
-local Promise = require(script.Parent.Promise);
-local Util = require(script.Parent.Util);
-local Logger = require(script.Parent.Logger);
-local UserIdsCache = require(script.Parent.UserIdCache);
+local Constants = require(script.Parent.Constants)
+local Ordered = require(script.Ordered)
+local TopRows = require(script.TopRows)
+local Totals = require(script.Totals)
 
--- Variables
-local Compression = Util.Compression;
-local SmartAssert = Util.SmartAssert;
-local Cancel = task.cancel;
-local Spawn = task.spawn;
+local MAX_KEY_LENGTH: number = Constants.MAX_KEY_LENGTH
+local MIN_ROLLING_EXPIRY: number = Constants.MIN_ROLLING_EXPIRY
+local MAX_ROLLING_EXPIRY: number = Constants.MAX_ROLLING_EXPIRY
+local WINDOWS: { string } = Constants.WINDOWS
 
--- Constants
-local SHARD_COUNTS = { -- Feel free to change these based on how many MAU your game does have
-	["Hourly"] = 1,
-	["Daily"] = 1,
-	["Weekly"] = 2,
-	["Monthly"] = 3,
+type Cut = TopRows.Cut
+type Kind = Totals.Kind
+type Record = Totals.Record
+type Row = TopRows.Row
+type Totals = Totals.Totals
+
+export type BoardConfig = string | {
+	expirySeconds: number,
+	key: string,
 }
 
--- Supports Daily, Weekly, Monthly and AllTime currently
---[=[
-    @within Board
-    @type LeaderboardType "Hourly" | "Daily" | "Weekly" | "Monthly" | "Yearly" | "AllTime" | "Rolling" | string
-]=]
-export type LeaderboardType = "Hourly" | "Daily" | "Weekly" | "Monthly" | "Yearly" | "AllTime" | "Rolling" | string;
-
---[=[
-    @within Board
-    @type Board () -> Board
-]=]
-export type Board = typeof(setmetatable({} :: BoardArguments, {} :: Object));
-
---[=[
-	@within Board
-	@interface BoardArguments
-	@field _serviceKey string
-	@field _storeUsing string
-	@field _store MemoryStoreSortedMap | OrderedDataStore | MemoryShard
-	@field _threads {thread}
-]=]
-export type BoardArguments = {
-	_type: LeaderboardType,
-	_serviceKey: string,
-	_storeUsing: string,
-	_store: MemoryStoreSortedMap | OrderedDataStore | MemoryShard,
-	_threads: {thread},
-	_logger: Logger.Logger?,
+type Fields = {
+	_key: string,
+	_totals: Totals?, -- Every board's totals and windows but AllTime's, which keeps only highest values
+	_cut: Cut?, -- The cutoff this server's last read set, nil until it first reads the board
 }
 
---[=[
-	@within Board
-	@interface TopData
-	@field Rank number
-	@field UserId number
-	@field Value number
-	@field Username string
-	@field DisplayName string
-]=]
-export type TopData = {
-	Rank: number,
-	UserId: number,
-	Value: number,
-	Username: string,
-	DisplayName: string,
-}
+--[[
+    Builds a board once its configuration validates. A key string builds
+    the period its name gives, or AllTime, and a table builds a rolling
+    board whatever its name
+--]]
 
-type MemoryShard = MemoryShard.MemoryShard;
+function Board.new(name: string, config: BoardConfig): Self
+	Board.validate(name, config)
 
---[=[
-	@within Board
-	@interface Object
-	@field __index Object
-	@field Update (self: Board, userId: number, value: number | (number) -> (number)) -> Promise.TypedPromise<boolean>
-	@field Get (self: Board, amount: number, sortDirection: string) -> Promise.TypedPromise<{TopData}>
-	@field Destroy (self: Board) -> ()
-	@field new (serviceKey: string, leaderboardType: LeaderboardType, rollingExpiry: number?, debugMode: boolean?) -> Board
-]=]
-type Object = {
-	__index: Object,
-	Update: (self: Board, userId: number, value: number | (number) -> (number)) -> Promise.TypedPromise<boolean>,
-	Get: (self: Board, amount: number, sortDirection: string) -> Promise.TypedPromise<{TopData}>,
-	Destroy: (self: Board) -> (),
-	new: (serviceKey: string, leaderboardType: LeaderboardType, rollingExpiry: number?, debugMode: boolean?) -> Board,
-}
+	local key: string = Board.keyOf(config)
+	local totals: Totals? = nil
+	if type(config) == "table" then
+		totals = Totals.new(key, "Rolling", config.expirySeconds)
+	elseif name ~= "AllTime" then
+		totals = Totals.new(key, name :: Kind) -- One of WINDOWS, as validate checked
+	end
 
---[=[
-	@class Board
-
-	This class is used to create a new leaderboard board.
-]=]
-local Board: Object = {} :: Object;
-Board.__index = Board;
-
-local function Transform(rank: number, key: number, value: number): TopData
-	return {
-		Rank = rank,
-		Value = Compression.Decompress(value),
-		UserId = key,
-		Username = UserIdsCache:GetNameFromUserId(key),
-		DisplayName = "Not supported yet",
-	};
+	return setmetatable({
+		_key = key,
+		_totals = totals,
+		_cut = nil :: Cut?,
+	}, Board)
 end
 
--- local function GetRequestBudget(typeOfBudget: Enum.DataStoreRequestType): number
--- 	return DataStoreService:GetRequestBudgetForRequestType(typeOfBudget);
--- end
+--[[
+    Throws, naming the board, unless its configuration is one the package
+    builds: a key string for a period or AllTime, or a rolling board's
+    expiry and key, the key at most MAX_KEY_LENGTH characters
+--]]
 
-local function ShardCalculation(rollingExpiry: number): number
-	-- desmos latex: f(x) = \lfloor 1 + 20 \log_{10}(\frac{x}{1.3 \times 10^7}) \rfloor
-	return math.floor(math.clamp((1 + 20 * math.log10(rollingExpiry * 0.000013) / math.log10(20)), 1, 30) + 0.5);
+function Board.validate(name: string, config: BoardConfig)
+	assert(type(name) == "string", `A board's name is a string, and {name} is a {typeof(name)}`)
+	assert(
+		type(config) == "string" or type(config) == "table",
+		`Board {name} takes a key string or a table of expirySeconds and key, not a {typeof(config)}`
+	)
+
+	local bounds: string = `a whole number of seconds from {MIN_ROLLING_EXPIRY} to {MAX_ROLLING_EXPIRY}`
+
+	if type(config) == "table" then
+		-- Whole seconds, since each row's expiry is what is left of the window and a map takes whole seconds
+		local expirySeconds: any = config.expirySeconds
+		assert(
+			type(expirySeconds) == "number"
+				and expirySeconds % 1 == 0
+				and expirySeconds >= MIN_ROLLING_EXPIRY
+				and expirySeconds <= MAX_ROLLING_EXPIRY,
+			`Board {name}'s expirySeconds is {expirySeconds}, where a rolling board takes {bounds}`
+		)
+	else
+		local windows: string = table.concat(WINDOWS, ", ")
+		local rolling: string = `a table of expirySeconds and key builds a rolling board, taking {bounds}`
+		local limit: string = "a MemoryStore entry lives at most 45 days"
+		assert(
+			name ~= "Yearly",
+			`Board Yearly cannot be built, since {limit}. A key string builds {windows}, and {rolling}`
+		)
+		assert(
+			table.find(WINDOWS, name),
+			`Board {name} takes a key string only when named {windows}, and otherwise {rolling}`
+		)
+	end
+
+	local key: any = Board.keyOf(config)
+	assert(
+		type(key) == "string" and #key > 0 and #key <= MAX_KEY_LENGTH,
+		`Board {name}'s key is {key}, where a key is a string of 1 to {MAX_KEY_LENGTH} characters`
+	)
 end
 
-local function GetCurrentId(leaderboardType: string)
-	local CurrentHour = DateTime.now():ToUniversalTime().Hour;
-	local CurrentDay = DateTime.now():ToUniversalTime().Day;
-	local CurrentWeek = math.floor(os.date("!*t")["yday"] / 7);
-	local CurrentMonth = DateTime.now():ToUniversalTime().Month;
-	local CurrentYear = DateTime.now():ToUniversalTime().Year;
+--[[
+    Validates every board of an object, and throws when two share a key,
+    since a key names each of its board's stores
+--]]
 
-	return leaderboardType == "Hourly" and CurrentHour or leaderboardType == "Daily" and CurrentDay or leaderboardType == "Weekly" and CurrentWeek or leaderboardType == "Monthly" and CurrentMonth or leaderboardType == "Yearly" and CurrentYear or "AllTime" and "AllTime";
+function Board.validateAll(boards: { [string]: BoardConfig })
+	local owners: { [string]: string } = {}
+
+	for name: string, config: BoardConfig in boards do
+		Board.validate(name, config)
+
+		local key: string = Board.keyOf(config)
+		local owner: string? = owners[key]
+		assert(owner == nil, `Boards {owner} and {name} share the key {key}, where each board needs its own`)
+
+		owners[key] = name
+	end
 end
 
-local function ConstructStore(serviceKey: string, leaderboardType: LeaderboardType, rollingExpiry: number?): (string, MemoryStoreSortedMap | OrderedDataStore | MemoryShard)
-	-- print(rollingExpiry);
-	-- if (leaderboardType == "Hourly" or leaderboardType == "Daily" or leaderboardType == "Weekly" or leaderboardType == "Monthly" or leaderboardType == "Yearly") then
-	-- 	return "OrderedDataStore", DataStoreService:GetOrderedDataStore(`{GetCurrentId(leaderboardType)}-{serviceKey}`);
-	-- end;
+--[[
+    The key a board's configuration names its stores with
+--]]
 
-	-- If we are using a MemoryStore, we can just update the data
-	-- Not a viable solution anymore, limits are too poor
-	if (leaderboardType ~= "AllTime" or rollingExpiry) then
-		local ShardCount = rollingExpiry and ShardCalculation(rollingExpiry) or SHARD_COUNTS[leaderboardType];
-		return "MemoryStore", MemoryShard.new(leaderboardType, serviceKey, ShardCount, rollingExpiry);
-	end;
+function Board.keyOf(config: BoardConfig): string
+	if type(config) == "table" then
+		return config.key
+	end
 
-	return "OrderedDataStore", DataStoreService:GetOrderedDataStore(serviceKey);
+	return config
 end
 
---[=[
-	@param serviceKey string
-	@param leaderboardType LeaderboardType
-	@param rollingExpiry number?
-	@param debugMode boolean?
-	@return Board
+--[[
+    Adds to a player's total through the transform, which is given their
+    total in the current window and may run more than once. Resolves with
+    the new total once it has landed and its row has been tried, and
+    rejects when the total fails to land
+--]]
 
-	Creates a new board within the Leaderboard.
-]=]
-function Board.new(serviceKey: string, leaderboardType: LeaderboardType, rollingExpiry: number?, debugMode: boolean?): Board
-	local self = setmetatable({} :: BoardArguments, Board);
+function Board.update(self: Self, userId: number, transform: (old: number) -> number): any
+	local totals: Totals? = self._totals
+	if not totals then
+		return Ordered.update(self._key, userId, transform)
+	end
 
-	self._serviceKey = serviceKey;
-	self._storeType, self._store = ConstructStore(serviceKey, leaderboardType, rollingExpiry);
-	self._threads = {};
-	self._logger = Logger.new(`Board-{serviceKey}`, debugMode or false);
+	return totals:update(userId, transform):andThen(function (record: Record): any
+		local map: string = totals:map(record.window)
+		local ends: number = totals:ends(record.window)
 
-	-- New implementation: we just check if the current id is different from the previous one
-	if (leaderboardType == "Hourly" or leaderboardType == "Daily" or leaderboardType == "Weekly" or leaderboardType == "Monthly" or leaderboardType == "Yearly") then
-		local thread = Spawn(function()
-			local CurrentId = GetCurrentId(leaderboardType);
-			while (true) do
-				local NewId = GetCurrentId(leaderboardType);
-				if (NewId ~= CurrentId) then
-					CurrentId = NewId;
-					self._storeType, self._store = ConstructStore(serviceKey, leaderboardType);
-				end;
-				task.wait(5);
-			end;
-		end);
-		table.insert(self._threads, thread);
-	end;
-
-	return self;
+		return TopRows.write(self._cut, map, userId, record.total, ends):andThenReturn(record.total)
+	end)
 end
 
--- Gets the top data for a specific board
---[=[
-	@param amount number
-	@param sortDirection string?
-	@return Promise.TypedPromise<{TopData}>
-	@yields
+--[[
+    Reads the board's highest rows, highest first and at most the amount
+    asked. A read also sets the cutoff the board's writes check and trims
+    its map, and resolves once its trims have settled
+--]]
 
-	Gets the top data for a specific board.
-]=]
-function Board:Get(amount, sortDirection)
-	SmartAssert(type(amount) == "number", "Amount must be a number");
-	SmartAssert(amount <= 100, "You can only get the top 100.");
-	SmartAssert(amount > 0, "Amount must be greater than 0");
-	SmartAssert(type(sortDirection) == "nil" or typeof(sortDirection) == "string", "SortDirection must be a string");
-	sortDirection = sortDirection or "Descending";
+function Board.read(self: Self, amount: number): any
+	local totals: Totals? = self._totals
+	if not totals then
+		return Ordered.read(self._key, amount)
+	end
 
-	local function RetrieveTopData()
-		if (self._storeType == "MemoryStore") then
-			local Result = self._store:Get(amount, sortDirection):awaitValue();
-			local Promises = {};
-			for rank, data in pairs(Result) do
-				table.insert(Promises, Promise.new(function(resolve)
-					resolve(Transform(rank, data.key, data.value))
-				end));
-			end;
-			return Promise.all(Promises):awaitValue() :: {TopData};
-		else
-			-- local RequestBudget = GetRequestBudget(Enum.DataStoreRequestType.GetSortedAsync);
-			-- if (RequestBudget < 1) then
-			-- 	warn(`Skipping getting top data for {self._serviceKey} due to insufficient budget`);
-			-- 	return {};
-			-- end;
-			local Result = self._store:GetSortedAsync(if sortDirection == "Descending" then false else true, amount);
-			local Data = Result:GetCurrentPage() :: {any};
-			local Promises = {};
-			for rank, data in pairs(Data) do
-				table.insert(Promises, Promise.new(function(resolve)
-					resolve(Transform(rank, data.key, data.value))
-				end));
-			end;
-			return Promise.all(Promises):awaitValue() :: {TopData};
-		end;
-	end;
+	local map: string = totals:map(totals:opens(os.time()))
 
-	return Promise.new(function(resolve, reject)
-		local Success, Result = pcall(function()
-			return RetrieveTopData();
-		end);
-		if (not Success) then
-			warn(`Leaderboard had trouble getting top data with error: {Result}`);
-			return reject(Result);
-		end;
-		return resolve(Result);
-	end) :: Promise.TypedPromise<{TopData}>;
+	return TopRows.read(map, amount):andThen(function (rows: { Row }, cut: Cut): { Row }
+		self._cut = cut
+
+		return rows
+	end)
 end
 
--- Updates the data for a specific board (either MemoryStore (Shards), or OrderedDataStore)
---[=[
-	@param userId number
-	@param value number | (number) -> (number)
-	@yields
-	@return boolean
+--[[
+    Deletes the player's total and then their row in the current window,
+    or their AllTime entry, and rejects if either deletion fails
+--]]
 
-	Updates the data for a specific board (either MemoryStore (Shards), or OrderedDataStore).
-]=]
-function Board:Update(userId, value)
-	SmartAssert(type(userId) == "number", "UserId must be a number");
-	SmartAssert(type(value) == "function" or type(value) == "number", "Transformer must be a function or a number");
+function Board.delete(self: Self, userId: number): any
+	local totals: Totals? = self._totals
+	if not totals then
+		return Ordered.delete(self._key, userId)
+	end
 
-	-- If we are using a MemoryStore, we can just update the data
-	if (self._storeType == "MemoryStore") then
-		self._logger:Log(1, `Successfully updated data for ${userId} in {self._serviceKey}`);
-		return self._store:Set(userId, value);
-	end;
+	local map: string = totals:map(totals:opens(os.time()))
 
-	-- local Budget = GetRequestBudget(Enum.DataStoreRequestType.UpdateAsync);
-	-- if (Budget < 1) then
-	-- 	warn(`Skipping updating data for {userId} in {self._serviceKey} due to insufficient budget`);
-	-- 	return false;
-	-- end;
-
-	-- Using an actual DataStore, we need to set the data
-	return Promise.new(function(resolve, reject)
-		local Success, Result = pcall(function()
-			return self._store:UpdateAsync(userId, function(oldValue)
-				oldValue = oldValue and Compression.Decompress(oldValue) or 0;
-				local transformedValue = (type(value) == "function") and value(oldValue) or value;
-
-				-- If their oldValue is greater than the new value, we don't want to update it
-				if (oldValue > transformedValue) then
-					return nil;
-				end;
-
-				if (type(transformedValue) == "number") then
-					local compressedValue = Compression.Compress(transformedValue);
-					return compressedValue;
-				end;
-				return nil;
-			end);
-		end);
-		if (not Success) then
-			warn(`Leaderboard had trouble updating data with error: {Result}`);
-			return reject(Result);
-		end;
-		self._logger:Log(1, `Successfully updated data for {userId} in {self._serviceKey}`);
-		return resolve(Result);
-	end) :: Promise.TypedPromise<boolean>;
+	return totals:delete(userId):andThen(function (): any
+		return TopRows.delete(map, userId)
+	end)
 end
 
--- Destroys the board
---[=[
-	Destroys the board.
-]=]
-function Board:Destroy()
-	-- Destroy the threads
-	for _, thread in self._threads do
-		if (typeof(thread) == "thread") then
-			Cancel(thread);
-		end;
-	end;
+export type Board = Self
+type Self = typeof(setmetatable({} :: Fields, Board))
 
-	-- Destroy the store
-	if (self._storeType == "MemoryStore") then
-		self._store:Destroy();
-	end;
-
-	-- Destroy the logger
-	self._logger:Destroy();
-
-	-- Destroy the board
-	setmetatable(self, nil);
-end
-
--- Make indexing the class with the wrong key throw an error
-setmetatable(Board, {
-	__index = function(_, key)
-		error(`Attempt to get Board:{tostring(key)} (not a valid member)`, 2);
-	end,
-	__newindex = function(_, key, _)
-		error(`Attempt to set Board:{tostring(key)} (not a valid member)`, 2);
-	end,
-})
-
-return table.freeze({
-	new = Board.new,
-	Get = Board.Get,
-	Update = Board.Update,
-	Destroy = Board.Destroy,
-})
+return Board
