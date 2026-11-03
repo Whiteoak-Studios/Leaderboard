@@ -1,6 +1,6 @@
 # Leaderboard
 
-Leaderboard keeps time-windowed global leaderboards for a Roblox experience, on the server. One object holds up to seven boards, each a window over one stat: an hourly, daily, weekly or monthly board that empties at the end of each UTC period, an all-time board, and rolling boards whose entries expire a fixed time after a player's first write. A game queues amounts in memory as play happens, and the object's automation saves them and reads every board's top rows on an interval.
+Leaderboard keeps time-windowed global leaderboards for a Roblox experience, on the server. One object holds up to seven boards, each a window over one stat: an hourly, daily, weekly or monthly board that empties at the end of each UTC period, with daily and weekly boards free to choose their own reset time, an all-time board, and rolling boards whose entries expire a fixed time after a player's first write. A game queues amounts in memory as play happens, and the object's automation saves them and reads every board's top rows on an interval.
 
 Each board keeps only its top rows in a MemoryStore sorted map, with every player's running total in a standard DataStore, so its MemoryStore memory stays the same however many players write to it. Values are the exact whole numbers the game counted, every write is atomic across servers, and a failed write keeps its amount queued for the next save.
 
@@ -84,13 +84,15 @@ end
 | Configuration | Board |
 |---|---|
 | `Hourly = "key"` | Empties at the end of each UTC hour. |
-| `Daily = "key"` | Empties at the end of each UTC day. |
+| `Daily = "key"` | Empties at the end of each UTC day, at 00:00 UTC. |
+| `Daily = { key = "key", hour = h, minute = m? }` | Empties every day at h:m UTC. |
 | `Weekly = "key"` | Empties at the end of each week, which starts on Sunday 00:00 UTC. |
+| `Weekly = { key = "key", weekday = "Friday", hour = h?, minute = m? }` | Empties every week on that weekday at h:m UTC. |
 | `Monthly = "key"` | Empties at the end of each UTC month. |
 | `AllTime = "key"` | Never empties, and keeps each player's highest value. |
 | `AnyName = { expirySeconds = n, key = "key" }` | Rolling: each player's entry lives `n` seconds from their first write. |
 
-- A board's kind comes from its value, never from its name. A key string builds the window its name gives, so a key string is allowed only for those five names, and a table builds a rolling board under any name, `Daily` included.
+- A board's kind comes from its value, never from its name. A key string builds the window its name gives, so a key string is allowed only for those five names. A table with `expirySeconds` builds a rolling board under any name, `Daily` included, and a `Daily` or `Weekly` table with a reset time builds that window, turning at its own time.
 - `Yearly` is refused, since a MemoryStore entry lives at most 45 days.
 - A rolling expiry is a whole number of seconds from 60 to 3,888,000 (45 days).
 - A key is 1 to 50 characters, the longest name a DataStore takes, and no two boards of one object share a key.
@@ -98,6 +100,26 @@ end
 - A key names the board's stores, so a new key is a fresh, empty board. A key that carries a season or wipe number, such as `Kills-Wipe-{wipeNumber}`, starts a fresh board when the number changes, with no reset code.
 
 `new` throws on any configuration it cannot build, and an object that fails partway holds no slot.
+
+### Reset times
+
+A `Daily` or `Weekly` board given as a table empties at a time of its own instead of at midnight or Sunday midnight:
+
+```lua
+local kills = Leaderboard.new({
+	AllTime = "Kills-AllTime-1",
+	Daily = { key = "Kills-Daily-1", hour = 14, minute = 30 },
+	Weekly = { key = "Kills-Weekly-1", weekday = "Friday", hour = 14 },
+}, { automation = true, interval = 90 })
+```
+
+Here `Daily` starts a new day every day at 14:30 UTC, and `Weekly` a new week every Friday at 14:00 UTC. A new period opens an empty board, and every player's total for it starts from zero, as at any period's end.
+
+- `weekday` is one of `"Sunday"` to `"Saturday"`, `hour` a whole number from 0 to 23 and `minute` a whole number from 0 to 59. A `Weekly` table needs `weekday`, and its `hour` and `minute` default to 0. A `Daily` table needs `hour`, and its `minute` defaults to 0.
+- Only `Weekly` takes `weekday`, and only `Weekly` and `Daily` take `hour` and `minute`. A table with `expirySeconds` is a rolling board and takes none of the three. `new` throws on anything else, naming the board.
+- A key string keeps the default reset: 00:00 UTC for `Daily` and Sunday 00:00 UTC for `Weekly`. `Hourly` and `Monthly` always turn at the hour and the month.
+- The time is UTC, which has no daylight saving, so a board resets at the same UTC time all year. Where the clocks change, its local reset time moves by an hour twice a year.
+- To change a board's reset time, change its key as well. A board's stores are named by its key, so a new reset time on the old key leaves the current window mixing totals counted under the old schedule with the new one's. A new key starts the board empty on the new schedule.
 
 `automation` is `{ automation = true, interval = seconds, recordCount = n? }`. `interval` is required whenever `automation` is true, and the `Automation` type always asks for it, so a missing interval is a type error before it is a run-time one. 90 to 120 seconds suits most games. `recordCount` is the number of rows each automated read takes, a number or a table by board name, and defaults to 100.
 

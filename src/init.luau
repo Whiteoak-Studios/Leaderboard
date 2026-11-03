@@ -27,11 +27,15 @@ local MAX_BOARDS: number = Constants.MAX_BOARDS
 --- seven boards, queues increments in memory, saves them to the stores and
 --- reads each board's highest rows, by hand or on its automation
 
---- @type BoardConfig string | { expirySeconds: number, key: string }
+--- @type BoardConfig string | { expirySeconds: number, key: string } | { key: string, weekday: Weekday, hour: number?, minute: number? } | { key: string, hour: number, minute: number? }
 --- @within Leaderboard
 --- A board's storage. A key string builds the window a board named Hourly,
---- Daily, Weekly, Monthly or AllTime keeps, and a table builds a rolling
---- board of any name, its window `expirySeconds` from each player's first write
+--- Daily, Weekly, Monthly or AllTime keeps, a week from Sunday 00:00 UTC
+--- and a day from 00:00, and a table of `expirySeconds` and `key` builds a
+--- rolling board of any name, its window `expirySeconds` from each player's
+--- first write. Weekly also takes `{ key, weekday, hour?, minute? }` and Daily
+--- `{ key, hour, minute? }`, turning at that time UTC. A weekday is "Sunday"
+--- to "Saturday", an hour 0 to 23 and a minute 0 to 59, whole, 0 if left out
 
 export type BoardConfig = Board.BoardConfig
 export type Automation = Types.Automation

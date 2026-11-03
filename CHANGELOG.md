@@ -19,6 +19,7 @@ A rewrite of the whole package on luau-lsp's new type checker and Whiteoak's cod
 ### Added
 
 - `:delete(boards, userId)` removes a player from each board and drops their queued amount.
+- A `Weekly` board can reset on a weekday, hour and minute of its own, `{ key, weekday, hour?, minute? }`, and a `Daily` board at an hour and minute of its own, `{ key, hour, minute? }`, both in UTC. A key string keeps Sunday 00:00 and 00:00. A board whose reset time changes needs a new key, since its old key's totals count the old schedule's periods.
 - `new` and every method check their arguments and throw on a bad one, before anything is queued or written.
 
 ### Removed

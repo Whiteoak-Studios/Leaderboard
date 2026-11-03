@@ -19,13 +19,21 @@ local CLOSE_FLEET: string = "B3close" -- The label in the keys of the fleet the 
 local WINDOWS: { string } = Constants.WINDOWS
 
 type BoardConfig = Board.BoardConfig
-type Kind = Totals.Kind
 type Totals = Totals.Totals
+type Weekday = Board.Weekday
+
+-- A Weekly or Daily board's reset time UTC, with a weekday only on a Weekly one
+type Reset = {
+	weekday: Weekday?,
+	hour: number,
+	minute: number?,
+}
 
 type Check = {
-	boards: { string }, -- A window's name takes a key, and any other name builds a rolling board
+	boards: { string }, -- A window's name takes a key or its resets entry, and any other name builds a rolling board
 	users: { number },
 	expirySeconds: number?, -- The rolling boards' window, ROLLING_EXPIRY when nil
+	resets: { [string]: Reset }?, -- The boards that turn at their own reset time, by name
 }
 
 type Store = "totals" | "map" | "ordered"
@@ -40,7 +48,11 @@ export type Entry = {
 
 -- Every check's boards and the players it writes, which the sweep deletes; each benchmark deletes its own
 local CHECKS: { [string]: Check } = {
-	writes = { boards = { "Daily", "Wipe", "AllTime" }, users = { 1001 } },
+	writes = {
+		boards = { "Daily", "Weekly", "Wipe", "AllTime" },
+		users = { 1001 },
+		resets = { Daily = { hour = 14, minute = 30 }, Weekly = { weekday = "Friday", hour = 14 } },
+	},
 	automation = { boards = { "Daily", "AllTime" }, users = { 1002 } },
 	rolling = { boards = { "Wipe" }, users = { 1003 }, expirySeconds = Constants.MIN_ROLLING_EXPIRY },
 	delete = { boards = { "Daily", "AllTime" }, users = { 1004 } },
@@ -65,11 +77,15 @@ local Checks = {
 }
 
 --[[
-    A board's configuration under a key: the key itself for a window, or a
-    rolling board's expiry and key
+    A board's configuration under a key: its key and reset time when it has
+    one, the key itself for a window, or a rolling board's expiry and key
 --]]
 
-local function configOf(name: string, key: string, expirySeconds: number): BoardConfig
+local function configOf(name: string, key: string, expirySeconds: number, reset: Reset?): BoardConfig
+	if reset then
+		return { key = key, weekday = reset.weekday, hour = reset.hour, minute = reset.minute }
+	end
+
 	if table.find(WINDOWS, name) then
 		return key
 	end
@@ -84,10 +100,11 @@ end
 
 function Checks.boards(runId: string, check: string): { [string]: BoardConfig }
 	local plan: Check = CHECKS[check]
+	local resets: { [string]: Reset } = plan.resets or {}
 	local boards: { [string]: BoardConfig } = {}
 
 	for _, name: string in plan.boards do
-		boards[name] = configOf(name, `{runId}-{check}-{name}`, plan.expirySeconds or ROLLING_EXPIRY)
+		boards[name] = configOf(name, `{runId}-{check}-{name}`, plan.expirySeconds or ROLLING_EXPIRY, resets[name])
 	end
 
 	return boards
@@ -163,8 +180,8 @@ end
 --]]
 
 function Checks.mapName(board: string, config: BoardConfig): string
-	local kind: Kind = (type(config) == "table" and "Rolling" or board) :: Kind -- A period's name otherwise
-	local totals: Totals = Totals.new(Board.keyOf(config), kind)
+	-- Callers pass only boards with a map, which every board but AllTime's key string has
+	local totals: Totals = Board.totalsOf(board, config) :: Totals
 
 	return totals:map(totals:opens(os.time()))
 end
