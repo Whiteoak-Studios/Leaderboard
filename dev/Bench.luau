@@ -74,10 +74,6 @@ local function build(objects: { { [string]: BoardConfig } }): { Object }
 	return built
 end
 
-local function seconds(started: number): string
-	return string.format("%.2f", os.clock() - started)
-end
-
 --[[
     The map's size while servers write: copies of the package each save
     players into an unread map, as every server does at a period's first
@@ -152,7 +148,7 @@ function Bench.trims(runId: string): (boolean, string)
 
 			local before: number = sizeOf()
 			Stores.spend(READ_UNITS)
-			
+
 			await(objects[1]:getAll("All"))
 
 			local after: number = sizeOf()
@@ -240,7 +236,7 @@ function Bench.readCost(runId: string): (boolean, string)
 			end
 		end
 
-		local took: string = seconds(started)
+		local took: string = string.format("%.2f", os.clock() - started)
 		local moved: string = Stores.moved(before, Stores.budgets())
 
 		local perMinute: number = MINUTE / READ_INTERVAL
@@ -335,7 +331,7 @@ function Bench.saveCost(runId: string, players: number): (boolean, string)
 		for _, object: Object in objects do
 			local began: number = os.clock()
 			local saved: boolean, reason: any = object:save():timeout(AWAIT_DEADLINE):await()
-			table.insert(times, seconds(began))
+			table.insert(times, string.format("%.2f", os.clock() - began))
 
 			if not saved then
 				table.insert(failures, tostring(reason))

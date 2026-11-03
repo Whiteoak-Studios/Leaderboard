@@ -150,7 +150,7 @@ end
 
 function Leaderboard.increment(self: Self, boards: Targets, userId: number, amount: number)
 	self:_checkLive("increment")
-	
+
 	local names: { string } = Validate.targets("increment", self._names, boards)
 	Validate.userId("increment", userId)
 	Validate.count("increment", "an amount", amount)
@@ -163,7 +163,8 @@ end
 --- Writes the value straight to each named board, as a number or as a
 --- function given the player's stored value. An `AllTime` board keeps the
 --- higher value. A bad number throws at the call, and a function whose
---- return breaks the same rule rejects that board's write
+--- return breaks the same rule rejects that board's write. A row whose
+--- write fails once the value has landed waits for the next save
 --- @method set
 --- @within Leaderboard
 --- @param boards "All" | { [string]: true } -- Every board, or a dictionary holding true for each board it targets
@@ -173,7 +174,7 @@ end
 
 function Leaderboard.set(self: Self, boards: Targets, userId: number, value: number | (old: number) -> number): any
 	self:_checkLive("set")
-	
+
 	local names: { string } = Validate.targets("set", self._names, boards)
 	Validate.userId("set", userId)
 
@@ -199,7 +200,12 @@ function Leaderboard.set(self: Self, boards: Targets, userId: number, value: num
 
 	local writes: { any } = {}
 	for _, name: string in names do
-		local write: any = self._boards[name]:update(userId, transform)
+		-- A value that landed with its row missed queues 0, so the next save writes the row
+		local write: any = self._boards[name]:update(userId, transform):andThen(function (_: number, missed: boolean?)
+			if missed then
+				self._queue:add(userId, name, 0)
+			end
+		end)
 		table.insert(writes, write)
 	end
 

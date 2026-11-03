@@ -81,24 +81,28 @@ end
 --[[
     Writes a player's row when their total belongs on the board, with the
     total as its value and sort key and the time left in its window as its
-    expiry. Always resolves, since a failed write only warns and the
-    player's next update writes the row again
+    expiry. Always resolves, with whether the row missed: a failed write
+    only warns, and the object's next save writes the row again
 --]]
 
 function TopRows.write(cut: Cut?, map: string, userId: number, total: number, ends: number): any
 	-- A window that has ended takes no row, and a map refuses an expiry that is not positive
 	local remaining: number = ends - os.time()
 	if remaining <= 0 or not belongs(cut, map, userId, total) then
-		return Promise.resolve()
+		return Promise.resolve(false)
 	end
 
 	return Promise.try(function ()
 		MemoryStoreService:GetSortedMap(map):UpdateAsync(`{userId}`, function (): (number, number)
 			return total, total
 		end, remaining)
-	end):catch(function (reason: any)
-		warn(`Leaderboard could not write {userId}'s row to {map}, so their next update writes it again: {reason}`)
 	end)
+		:andThenReturn(false)
+		:catch(function (reason: any): boolean
+			warn(`Leaderboard could not write {userId}'s row to {map}, so the next save writes it again: {reason}`)
+
+			return true
+		end)
 end
 
 function TopRows.delete(map: string, userId: number): any

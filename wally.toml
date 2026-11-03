@@ -1,7 +1,7 @@
 [package]
 name = "fadeluc-123/leaderboard"
 description = "Time-windowed global leaderboards for Roblox servers over MemoryStore and OrderedDataStore"
-version = "1.5.0"
+version = "2.0.0"
 registry = "https://github.com/UpliftGames/wally-index"
 realm = "server"
 license = "Apache-2.0"

@@ -138,8 +138,9 @@ end
 --[[
     Adds to a player's total through the transform, which is given their
     total in the current window and may run more than once. Resolves with
-    the new total once it has landed and its row has been tried, and
-    rejects when the total fails to land
+    the new total once it has landed and its row has been tried, and beside
+    it whether the row missed, which AllTime's never does. Rejects when the
+    total fails to land
 --]]
 
 function Board.update(self: Self, userId: number, transform: (old: number) -> number): any
@@ -152,7 +153,10 @@ function Board.update(self: Self, userId: number, transform: (old: number) -> nu
 		local map: string = totals:map(record.window)
 		local ends: number = totals:ends(record.window)
 
-		return TopRows.write(self._cut, map, userId, record.total, ends):andThenReturn(record.total)
+		return TopRows.write(self._cut, map, userId, record.total, ends)
+			:andThen(function (missed: boolean): (number, boolean)
+				return record.total, missed
+			end)
 	end)
 end
 

@@ -55,8 +55,9 @@ end
 --[[
     Takes the queue and writes it through MAX_IN_FLIGHT lanes, each writing
     its next entry once its last has settled and the server's pool has room.
-    A failed write puts its amount back, and the save rejects once every
-    write has settled
+    A failed write puts its amount back, a write whose row missed queues 0
+    so the next save writes the row, and the save rejects once every write
+    has settled
 --]]
 
 function Write._write(self: Leaderboard): any
@@ -80,11 +81,14 @@ function Write._write(self: Leaderboard): any
 
 				table.insert(writes, write)
 
-				local written: boolean = write:await()
+				-- A landed write gives its total and then whether its row missed
+				local written: boolean, _: any, missed: boolean? = write:await()
 				free()
 
 				if not written then
 					self._queue:restore(entry)
+				elseif missed then
+					self._queue:add(entry.userId, entry.board, 0)
 				end
 			end
 
