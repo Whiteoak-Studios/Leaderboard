@@ -17,13 +17,19 @@ local MAX_KEY_LENGTH: number = 50 -- The longest board key, the most characters 
 local MAX_IN_FLIGHT: number = 30 -- The most board writes a server's saves keep in flight, its request queue's length
 local READS_PER_SAVE: number = 2 -- The automated reads to each automated save, the first save one interval in
 local MAX_NAME_BATCH: number = 200 -- The most ids one GetUserInfosByUserIdsAsync takes
+local MINUTE_SECONDS: number = 60 -- The seconds in a minute of a Weekly or Daily board's reset time
 local HOUR_SECONDS: number = 3600 -- The seconds in an Hourly board's period
 local DAY_SECONDS: number = 86400 -- The seconds in a Daily board's period
 local WEEK_SECONDS: number = 604800 -- The seconds in a Weekly board's period
 local WEEK_START: number = 259200 -- When week 0 starts, Sunday 1970-01-04 00:00 UTC
+local MAX_HOUR: number = 23 -- The latest hour a Weekly or Daily board resets at, from 0
+local MAX_MINUTE: number = 59 -- The latest minute of that hour, from 0
 local MONTHS_PER_YEAR: number = 12 -- A Monthly board's period number is year * MONTHS_PER_YEAR + month - 1
 
 local WINDOWS: { string } = { "Hourly", "Daily", "Weekly", "Monthly", "AllTime" } -- The names a key string builds
+
+-- The days a Weekly board resets on, from WEEK_START's Sunday, so a day's index less one is its days after Sunday
+local WEEKDAYS: { string } = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" }
 
 return {
 	MAX_OBJECTS = MAX_OBJECTS,
@@ -38,10 +44,14 @@ return {
 	MAX_IN_FLIGHT = MAX_IN_FLIGHT,
 	READS_PER_SAVE = READS_PER_SAVE,
 	MAX_NAME_BATCH = MAX_NAME_BATCH,
+	MINUTE_SECONDS = MINUTE_SECONDS,
 	HOUR_SECONDS = HOUR_SECONDS,
 	DAY_SECONDS = DAY_SECONDS,
 	WEEK_SECONDS = WEEK_SECONDS,
 	WEEK_START = WEEK_START,
+	MAX_HOUR = MAX_HOUR,
+	MAX_MINUTE = MAX_MINUTE,
 	MONTHS_PER_YEAR = MONTHS_PER_YEAR,
 	WINDOWS = WINDOWS,
+	WEEKDAYS = WEEKDAYS,
 }

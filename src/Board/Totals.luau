@@ -20,7 +20,8 @@ type Period = {
 	start: number,
 }
 
--- Each fixed period's length in seconds, and when its period 0 starts: the epoch, or the first Sunday for weeks
+-- Each fixed period's length in seconds, and when its period 0 starts unless a board gives its own: the epoch, or
+-- the first Sunday for weeks
 local PERIODS: { [string]: Period } = {
 	Hourly = { length = Constants.HOUR_SECONDS, start = 0 },
 	Daily = { length = Constants.DAY_SECONDS, start = 0 },
@@ -43,13 +44,22 @@ type Fields = {
 	_key: string,
 	_kind: Kind,
 	_expirySeconds: number, -- A rolling window's length, unused by a period
+	_start: number, -- When a fixed period's period 0 starts, unused by Monthly and Rolling
 }
 
-function Totals.new(key: string, kind: Kind, expirySeconds: number?): Self
+--[[
+    Builds a board's totals. A fixed period's period 0 starts at the given
+    start, or at the kind's own when none is given
+--]]
+
+function Totals.new(key: string, kind: Kind, expirySeconds: number?, start: number?): Self
+	local period: Period? = PERIODS[kind]
+
 	return setmetatable({
 		_key = key,
 		_kind = kind,
 		_expirySeconds = expirySeconds or 0,
+		_start = start or period and period.start or 0,
 	}, Totals)
 end
 
@@ -91,7 +101,7 @@ end
 function Totals.opens(self: Self, now: number): number
 	local period: Period? = PERIODS[self._kind]
 	if period then
-		return (now - period.start) // period.length
+		return (now - self._start) // period.length
 	end
 
 	if self._kind == "Monthly" then
@@ -113,7 +123,7 @@ end
 function Totals.ends(self: Self, window: number): number
 	local period: Period? = PERIODS[self._kind]
 	if period then
-		return period.start + (window + 1) * period.length
+		return self._start + (window + 1) * period.length
 	end
 
 	if self._kind == "Monthly" then

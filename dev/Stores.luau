@@ -1,7 +1,7 @@
 --[[
     The live run's own view of the stores, safe to require in Edit: reads,
     writes and deletes straight to each store, MemoryStore pacing, the
-    DataStore budgets, an entry's size, the shutdown report and the sweep
+    DataStore budgets, the shutdown report and the sweep
 --]]
 
 --!strict
@@ -19,15 +19,7 @@ local PACE_POLL: number = 0.25 -- Seconds between looks at the window while it i
 local RETRIES: number = 3 -- Tries a raw request gets, since Studio's stores fail now and then
 local RETRY_WAIT: number = 1 -- Seconds between them
 local DELETE_DEADLINE: number = 1800 -- Seconds a deletion runs before it stops and reports what is left
-local KILOBYTE: number = 1024 -- The bytes in a kB, as the quotas count them
-local MEMORY_QUOTA: number = 64 * KILOBYTE -- Studio's MemoryStore quota in bytes with no users
-local USER_QUOTA: number = 1.2 * KILOBYTE -- What one user adds to it
-local SIZE_CAP: number = 5000 -- Entries the size check writes at most before it gives up on reaching the quota
-local SIZE_DEADLINE: number = 900 -- Seconds the size check's fill runs at most
-local SIZE_VALUE: number = 86400 -- Each entry's value and sort key, a day of play time, as wide as a total
 local CLOSE_AMOUNT: number = Checks.CLOSE_AMOUNT
-
-local QUOTA_REFUSALS: { string } = { "memoryoverlimit", "memory quota" } -- How the quota's refusal reads, lowercased
 
 type Entry = Checks.Entry
 
@@ -258,58 +250,6 @@ function Stores.budgetReport(): (boolean, string)
 	table.sort(listed)
 
 	return #listed > 0, `the DataStore budgets now: {table.concat(listed, ", ")}`
-end
-
---[[
-    An entry's size: rows shaped as the package writes them go into a
-    scratch map until the quota refuses one, then all are deleted. What fits
-    gives an entry's size at most, counting anything else in the store
---]]
-
-function Stores.entrySize(runId: string): (boolean, string)
-	local name: string = `{runId}-entrySize`
-	local deadline: number = os.clock() + SIZE_DEADLINE
-	local written: { Entry } = {}
-	local refusal: string? = nil
-
-	for _, userId: number in Checks.span(SIZE_CAP) do
-		if os.clock() >= deadline then
-			break
-		end
-
-		local entry: Entry = { store = "map", name = name, key = `{userId}`, board = "entrySize", userId = userId }
-		local stored: boolean, reason: any = Stores.set(entry, SIZE_VALUE)
-		if not stored then
-			refusal = tostring(reason)
-			break
-		end
-
-		table.insert(written, entry)
-	end
-
-	local removed: boolean, removal: string = Stores.delete(written)
-	local count: number = #written
-
-	if not refusal then
-		return false, `{count} entries went in and none was refused before the cap or the deadline; {removal}`
-	end
-
-	local lowered: string = string.lower(refusal)
-	local plain: boolean = true -- Finds each marker as text rather than as a pattern
-	local quota: boolean = false
-	for _, marker: string in QUOTA_REFUSALS do
-		quota = quota or string.find(lowered, marker, 1, plain) ~= nil
-	end
-
-	local alone: string = string.format("%.1f", MEMORY_QUOTA / math.max(count, 1))
-	local withOne: string = string.format("%.1f", (MEMORY_QUOTA + USER_QUOTA) / math.max(count, 1))
-	local quotaSize: string = string.format("%.1f", MEMORY_QUOTA / KILOBYTE)
-	local quotaWithOne: string = string.format("%.1f", (MEMORY_QUOTA + USER_QUOTA) / KILOBYTE)
-	local fit: string = `{count} entries fit before the store refused one with "{refusal}"`
-	local size: string = `so an entry takes at most {alone} bytes of a {quotaSize} kB quota`
-	local sizeWithOne: string = `or {withOne} of {quotaWithOne} kB with one user`
-
-	return quota and removed and count > 0, `{fit}, {size}, {sizeWithOne}; {removal}`
 end
 
 --[[
